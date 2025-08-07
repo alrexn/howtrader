@@ -6,12 +6,12 @@ from strategies.atr_rsi_15min_strategy import AtrRsi15MinStrategy
 
 engine = BacktestingEngine()
 engine.set_parameters(
-    vt_symbol="BTCUSDT.BINANCE",
-    interval=Interval.MINUTE,
-    start=datetime(2020, 1, 1),
-    end=datetime(2020, 5, 1),
-    rate=4/10000,
-    slippage=0,
+    vt_symbol="BTCUSDT.OKX",
+    interval=Interval.MINUTE_5,  # 改为5分钟间隔，匹配你的数据
+    start=datetime(2023, 1, 1),
+    end=datetime(2023, 6, 1),
+    rate=0.0002,
+    slippage=0.01,
     size=1,
     pricetick=0.01,
     capital=1000000,

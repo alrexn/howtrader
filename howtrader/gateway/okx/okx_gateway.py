@@ -1,7 +1,9 @@
 """
-1. 只支持单币种保证金模式
-2. 只支持全仓模式
-3. 只支持单向持仓模式
+1. 支持单币种保证金模式和跨币种保证金模式
+2. 支持全仓模式和逐仓模式
+3. 支持单向持仓模式(net_mode)和双向持仓模式(long_short_mode)
+4. 支持合约模式，包括SWAP和FUTURES
+5. 支持开平仓模式，支持posSide参数
 
 """
 
@@ -118,7 +120,10 @@ class OkxGateway(BaseGateway):
         "passphrase": "",
         "proxy_host": "",
         "proxy_port": 0,
-        "server": ["REAL", "TEST"]
+        "server": ["REAL", "TEST"],
+        "position_mode": "long_short_mode",  # net_mode 或 long_short_mode
+        "margin_mode": "cross",  # cross 或 isolated
+        "account_type": "multi_currency"  # single_currency 或 multi_currency
     }
 
     exchanges: Exchange = [Exchange.OKX]
@@ -139,6 +144,9 @@ class OkxGateway(BaseGateway):
         secret: str = setting["secret"]
         passphrase: str = setting["passphrase"]
         server: str = setting["server"]
+        position_mode: str = setting.get("position_mode", "long_short_mode")
+        margin_mode: str = setting.get("margin_mode", "cross")
+        account_type: str = setting.get("account_type", "multi_currency")
 
         if not setting["proxy_host"] and isinstance(setting["proxy_host"], str):
             proxy_host: str = setting["proxy_host"]
@@ -156,20 +164,22 @@ class OkxGateway(BaseGateway):
             passphrase,
             proxy_host,
             proxy_port,
-            server
+            server,
+            position_mode,
+            margin_mode,
+            account_type
         )
-        self.ws_public_api.connect(
-            proxy_host,
-            proxy_port,
-            server
-        )
+
+        self.ws_public_api.connect(proxy_host, proxy_port, server)
         self.ws_private_api.connect(
             key,
             secret,
             passphrase,
             proxy_host,
             proxy_port,
-            server
+            server,
+            position_mode,
+            margin_mode
         )
 
         self.event_engine.unregister(EVENT_TIMER, self.process_timer_event)
@@ -215,6 +225,10 @@ class OkxGateway(BaseGateway):
         self.rest_api.stop()
         self.ws_public_api.stop()
         self.ws_private_api.stop()
+
+    def set_leverage(self, symbol: str, leverage: int, margin_mode: str = None) -> None:
+        """设置杠杆倍数"""
+        self.rest_api.set_leverage(symbol, leverage, margin_mode)
 
     def on_order(self, order: OrderData) -> None:
         """on order update"""
@@ -267,6 +281,9 @@ class OkxRestApi(RestClient):
         self.passphrase: str = ""
         self.simulated: bool = False
         self.time_offset_ms: float = 0
+        self.position_mode: str = ""
+        self.margin_mode: str = ""
+        self.account_type: str = ""
 
     def sign(self, request: Request) -> Request:
         """signature"""
@@ -305,13 +322,19 @@ class OkxRestApi(RestClient):
         passphrase: str,
         proxy_host: str,
         proxy_port: int,
-        server: str
+        server: str,
+        position_mode: str,  #OKx官方API rest   持仓方式long_short_mode：开平仓模式 net_mode：买卖模式
+        margin_mode: str,  #OKx官方API rest  保证金模式字段 isolated 逐仓，cross 全仓
+        account_type: str    #OKx官方API rest  账户类型字段 2为合约，3为跨币种保证金模式
     ) -> None:
         """connect rest api"""
         self.key = key
         self.secret = secret.encode()
         self.passphrase = passphrase
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
+        self.position_mode = position_mode
+        self.margin_mode = margin_mode
+        self.account_type = account_type
 
         if server == "TEST":
             self.simulated = True
@@ -323,17 +346,127 @@ class OkxRestApi(RestClient):
         self.query_time()
         self.query_open_orders()
         self.query_instrument()
-        self.set_position_mode()
+        
+        # 设置账户配置
+        self.set_position_mode(position_mode)
+        self.set_margin_mode(margin_mode)
+        self.set_account_type(account_type)
+        
+        # 延迟查询当前设置，验证是否生效
+        self.add_request(
+            "GET",
+            "/api/v5/account/position-risk",
+            callback=self.on_query_position_risk,
+            delay=2000  # 2秒后查询
+        )
 
-    def set_position_mode(self) -> None:
+    def set_position_mode(self, position_mode: str) -> None:
+        """设置持仓模式 - 根据OKX API文档修正"""
+        # OKX API: posMode: long_short_mode 或 net_mode
+        data = {"posMode": position_mode}
+        self.gateway.write_log(f"🔄 正在设置持仓模式: {position_mode}")
         self.add_request(
             "POST",
             "/api/v5/account/set-position-mode",
-            data={"posMode": "net_mode"},
+            data=data,
             callback=self.on_position_mode)
 
+    def set_margin_mode(self, margin_mode: str) -> None:
+        """设置保证金模式 - 根据OKX API文档修正"""
+        # OKX API: mgnMode: isolated 或 cross
+        data = {"mgnMode": margin_mode}
+        self.gateway.write_log(f"🔄 正在设置保证金模式: {margin_mode}")
+        self.add_request(
+            "POST",
+            "/api/v5/account/set-margin-mode",
+            data=data,
+            callback=self.on_margin_mode)
+
+    def set_account_type(self, account_type: str) -> None:
+        """设置账户类型 - 根据OKX API文档修正"""
+        # OKX API: acctLv: 1=简单模式, 2=单币种保证金, 3=多币种保证金
+        if account_type == "multi_currency":
+            acct_lv = "3"  # 多币种保证金
+        elif account_type == "single_currency":
+            acct_lv = "2"  # 单币种保证金
+        else:
+            acct_lv = "1"  # 简单模式
+            
+        data = {"acctLv": acct_lv}
+        self.gateway.write_log(f"🔄 正在设置账户类型: {account_type} (acctLv={acct_lv})")
+        self.add_request(
+            "POST",
+            "/api/v5/account/set-account-level",
+            data=data,
+            callback=self.on_account_type)
+
+    def set_leverage(self, symbol: str, leverage: int, margin_mode: str = None) -> None:
+        """设置杠杆倍数"""
+        data = {
+            "instId": symbol,
+            "lever": str(leverage),
+            "mgnMode": margin_mode or self.margin_mode
+        }
+        
+        self.add_request(
+            "POST",
+            "/api/v5/account/set-leverage",
+            data=data,
+            callback=self.on_set_leverage)
+
     def on_position_mode(self, packet: dict, request: Request):
-        pass
+        """处理持仓模式设置响应"""
+        if packet.get("code") == "0":
+            self.gateway.write_log(f"✅ 持仓模式设置成功: {self.position_mode}")
+        else:
+            self.gateway.write_log(f"❌ 持仓模式设置失败: {packet}")
+            # 记录详细错误信息
+            if "msg" in packet:
+                self.gateway.write_log(f"错误信息: {packet['msg']}")
+
+    def on_margin_mode(self, packet: dict, request: Request):
+        """处理保证金模式设置响应"""
+        if packet.get("code") == "0":
+            self.gateway.write_log(f"✅ 保证金模式设置成功: {self.margin_mode}")
+        else:
+            self.gateway.write_log(f"❌ 保证金模式设置失败: {packet}")
+            if "msg" in packet:
+                self.gateway.write_log(f"错误信息: {packet['msg']}")
+
+    def on_account_type(self, packet: dict, request: Request):
+        """处理账户类型设置响应"""
+        if packet.get("code") == "0":
+            self.gateway.write_log(f"✅ 账户类型设置成功: {self.account_type}")
+        else:
+            self.gateway.write_log(f"❌ 账户类型设置失败: {packet}")
+            if "msg" in packet:
+                self.gateway.write_log(f"错误信息: {packet['msg']}")
+
+    def on_set_leverage(self, packet: dict, request: Request):
+        """处理杠杆设置响应"""
+        if packet.get("code") == "0":
+            self.gateway.write_log("✅ 杠杆设置成功")
+        else:
+            self.gateway.write_log(f"❌ 杠杆设置失败: {packet}")
+            if "msg" in packet:
+                self.gateway.write_log(f"错误信息: {packet['msg']}")
+
+    def on_query_position_risk(self, packet: dict, request: Request):
+        """查询持仓风险信息，验证账户设置"""
+        if packet.get("code") == "0":
+            data = packet.get("data", [])
+            if data:
+                risk_info = data[0]
+                self.gateway.write_log("📊 当前账户设置:")
+                self.gateway.write_log(f"   - 持仓模式: {risk_info.get('posMode', 'N/A')}")
+                self.gateway.write_log(f"   - 保证金模式: {risk_info.get('mgnMode', 'N/A')}")
+                self.gateway.write_log(f"   - 账户等级: {risk_info.get('acctLv', 'N/A')}")
+            else:
+                self.gateway.write_log("⚠️ 未获取到账户风险信息")
+        else:
+            self.gateway.write_log(f"❌ 查询账户风险信息失败: {packet}")
+            if "msg" in packet:
+                self.gateway.write_log(f"错误信息: {packet['msg']}")
 
     def query_open_orders(self) -> None:
         """query open orders"""
@@ -422,10 +555,42 @@ class OkxRestApi(RestClient):
             product: Product = PRODUCT_OKX2VT[d["instType"]]
             net_position: bool = True
 
-            if not d["ctMult"]:
+            # 使用ctVal作为真正的合约面值，而不是ctMult
+            ct_val = d.get("ctVal", "1")
+            # 处理空字符串的情况
+            if not ct_val or ct_val == "":
+                ct_val = "1"
+            try:
+                size: Decimal = Decimal(ct_val)
+            except (ValueError, decimal.InvalidOperation):
                 size: Decimal = Decimal("1")
-            else:
-                size: Decimal = Decimal(d["ctMult"])
+
+            # 处理tickSz，添加异常处理
+            tick_sz = d.get("tickSz", "0.1")
+            if not tick_sz or tick_sz == "":
+                tick_sz = "0.1"
+            try:
+                pricetick: Decimal = Decimal(tick_sz)
+            except (ValueError, decimal.InvalidOperation):
+                pricetick: Decimal = Decimal("0.1")
+
+            # 处理lotSz，添加异常处理
+            lot_sz = d.get("lotSz", "0.001")
+            if not lot_sz or lot_sz == "":
+                lot_sz = "0.001"
+            try:
+                min_volume: Decimal = Decimal(lot_sz)
+            except (ValueError, decimal.InvalidOperation):
+                min_volume: Decimal = Decimal("0.001")
+
+            # 处理minSz，添加异常处理
+            min_sz = d.get("minSz", "0.001")
+            if not min_sz or min_sz == "":
+                min_sz = "0.001"
+            try:
+                min_size: Decimal = Decimal(min_sz)
+            except (ValueError, decimal.InvalidOperation):
+                min_size: Decimal = Decimal("0.001")
 
             contract: ContractData = ContractData(
                 symbol=symbol,
@@ -433,9 +598,9 @@ class OkxRestApi(RestClient):
                 name=symbol,
                 product=product,
                 size=size,
-                pricetick=Decimal(d["tickSz"]),  # price
-                min_volume=Decimal(d["lotSz"]),  # volume precision
-                min_size=Decimal(d["minSz"]),
+                pricetick=pricetick,  # 使用处理后的价格精度
+                min_volume=min_volume,  # 使用处理后的最小数量
+                min_size=min_size,      # 使用处理后的最小大小
                 history_data=True,
                 net_position=net_position,
                 gateway_name=self.gateway_name,
@@ -463,20 +628,47 @@ class OkxRestApi(RestClient):
         )
 
     def query_history(self, req: HistoryRequest) -> List[BarData]:
-        """query kline/candles data"""
+        """query kline/candles data - 改进版：支持交叉时间和空数据处理"""
         buf: Dict[datetime, BarData] = {}
-        end_time: str = str(int(req.end.timestamp()//60) * 60 * 1000)
-        start_ts: int = int(req.start.timestamp()//60) * 60 * 1000  # ts in millisecond
-        path: str = "/api/v5/market/candles"
-
-        while True:
+        start_ts: int = int(req.start.timestamp() * 1000)  # 开始时间戳（毫秒）
+        end_ts: int = int(req.end.timestamp() * 1000)      # 结束时间戳（毫秒）
+        path: str = "/api/v5/market/history-candles"       # 使用历史数据API
+        
+        current_ts = start_ts
+        batch_size = 300  # OKX交易所限制为300条
+        
+        # 根据时间周期确定步长（毫秒），并添加小的交叉时间
+        if req.interval == Interval.MINUTE:
+            step_ms = batch_size * 60 * 1000        # 300分钟
+            overlap_ms = 5 * 60 * 1000              # 5分钟交叉
+        elif req.interval == Interval.HOUR:
+            step_ms = batch_size * 60 * 60 * 1000   # 300小时
+            overlap_ms = 2 * 60 * 60 * 1000         # 2小时交叉
+        elif req.interval == Interval.DAILY:
+            step_ms = batch_size * 24 * 60 * 60 * 1000  # 300天
+            overlap_ms = 24 * 60 * 60 * 1000        # 1天交叉
+        else:
+            step_ms = batch_size * 60 * 1000        # 默认按分钟
+            overlap_ms = 5 * 60 * 1000              # 5分钟交叉
+        
+        request_count = 0
+        empty_response_count = 0
+        max_empty_responses = 5  # 最大连续空响应次数
+        
+        while current_ts < end_ts:
+            # 计算当前批次的结束时间，添加交叉时间
+            batch_end_ts = min(current_ts + step_ms + overlap_ms, end_ts)
+            
             params: dict = {
                 "instId": req.symbol,
                 "bar": INTERVAL_VT2OKX[req.interval],
-                "limit": 300,
-                "after": end_time
+                "before": str(current_ts),      # before = 开始时间（更早）
+                "after": str(batch_end_ts),     # after = 结束时间（更晚）
+                "limit": str(batch_size)
             }
-
+            
+            request_count += 1
+            
             resp: Response = self.request(
                 "GET",
                 path,
@@ -490,42 +682,81 @@ class OkxRestApi(RestClient):
             else:
                 data: dict = resp.json()
 
-                if not data["data"]:
-                    m = data["msg"]
-                    msg = f"request historical candles failed: {m}"
-                    self.gateway.write_log(msg)
-                    break
+                if not data.get("data"):
+                    # 如果没有数据，先尝试用普通candles接口
+                    if path == "/api/v5/market/history-candles":
+                        path = "/api/v5/market/candles"
+                        continue
+                    else:
+                        # 空数据不break，继续下一个时间段
+                        empty_response_count += 1
+                        msg = f"batch {request_count}: no data available for {req.symbol} " \
+                              f"from {parse_timestamp(str(current_ts))} to {parse_timestamp(str(batch_end_ts))}"
+                        self.gateway.write_log(msg)
+                        
+                        # 如果连续多次空响应，可能已经超出可用数据范围
+                        if empty_response_count >= max_empty_responses:
+                            msg = f"连续{max_empty_responses}次空响应，可能已超出数据范围，结束查询"
+                            self.gateway.write_log(msg)
+                            break
+                        
+                        # 移动到下一个时间段继续
+                        current_ts = current_ts + step_ms
+                        continue
 
+                # 重置空响应计数
+                empty_response_count = 0
+                bars_in_batch = 0
+                
                 for bar_list in data["data"]:
                     ts, o, h, l, c, vol, _, _, confirmed = bar_list
-                    if confirmed:
+                    if confirmed == "1":  # 只要已确认的K线
                         dt = parse_timestamp(ts)
-                        bar: BarData = BarData(
-                            symbol=req.symbol,
-                            exchange=req.exchange,
-                            datetime=dt,
-                            interval=req.interval,
-                            volume=float(vol),
-                            open_price=float(o),
-                            high_price=float(h),
-                            low_price=float(l),
-                            close_price=float(c),
-                            gateway_name=self.gateway_name
-                        )
-                        buf[bar.datetime] = bar
+                        
+                        # 检查时间范围，避免重复数据
+                        bar_ts = int(dt.timestamp() * 1000)
+                        if bar_ts >= current_ts and bar_ts < current_ts + step_ms:
+                            bar: BarData = BarData(
+                                symbol=req.symbol,
+                                exchange=req.exchange,
+                                datetime=dt,
+                                interval=req.interval,
+                                volume=float(vol),
+                                open_price=float(o),
+                                high_price=float(h),
+                                low_price=float(l),
+                                close_price=float(c),
+                                gateway_name=self.gateway_name
+                            )
+                            # 使用datetime作为key自动去重
+                            buf[bar.datetime] = bar
+                            bars_in_batch += 1
 
-                begin: str = data["data"][-1][0]
-                end: str = data["data"][0][0]
-                end_time = begin
-                msg: str = f"request historical candles，{req.symbol} - {req.interval.value}，{parse_timestamp(begin)}" \
-                           f" - {parse_timestamp(end)}"
-                self.gateway.write_log(msg)
-                if int(begin) < start_ts:
-                    break
+                if bars_in_batch > 0:
+                    begin_dt = parse_timestamp(data["data"][-1][0])
+                    end_dt = parse_timestamp(data["data"][0][0])
+                    msg: str = f"batch {request_count}: {req.symbol} - {req.interval.value}, " \
+                              f"{begin_dt} ~ {end_dt}, {bars_in_batch} bars (去重后)"
+                    self.gateway.write_log(msg)
+                else:
+                    msg = f"batch {request_count}: no valid data after filtering"
+                    self.gateway.write_log(msg)
+                
+                # 移动到下一个时间段，不含交叉部分
+                current_ts = current_ts + step_ms
+                
+                # 避免频率限制
+                time.sleep(0.1)
 
+        # 按时间排序并返回
         index: List[datetime] = list(buf.keys())
         index.sort()
         history: List[BarData] = [buf[i] for i in index]
+        
+        msg = f"query_history complete: {req.symbol} - {req.interval.value}, " \
+              f"total {len(history)} bars, {request_count} requests"
+        self.gateway.write_log(msg)
+        
         return history
 
 
@@ -662,6 +893,10 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         self.key: str = ""
         self.secret: str = ""
         self.passphrase: str = ""
+        
+        # 添加持仓模式和保证金模式属性
+        self.position_mode: str = "long_short_mode"
+        self.margin_mode: str = "cross"
 
         self.reqid: int = 0
         self.order_count: int = 0
@@ -686,11 +921,15 @@ class OkxWebsocketPrivateApi(WebsocketClient):
         passphrase: str,
         proxy_host: str,
         proxy_port: int,
-        server: str
+        server: str,
+        position_mode: str = "long_short_mode",
+        margin_mode: str = "cross"
     ) -> None:
         self.key = key
         self.secret = secret.encode()
         self.passphrase = passphrase
+        self.position_mode = position_mode
+        self.margin_mode = margin_mode
 
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
         self.receive_timeout = 60
@@ -807,11 +1046,20 @@ class OkxWebsocketPrivateApi(WebsocketClient):
             pos: float = float(d.get("pos", "0"))
             price: float = get_float_value(d, "avgPx")
             pnl: float = get_float_value(d, "upl")
+            pos_side: str = d.get("posSide", "net")  # 获取持仓方向
+
+            # 根据持仓方向设置Direction
+            if pos_side == "long":
+                direction = Direction.LONG
+            elif pos_side == "short":
+                direction = Direction.SHORT
+            else:
+                direction = Direction.NET
 
             position: PositionData = PositionData(
                 symbol=symbol,
                 exchange=Exchange.OKX,
-                direction=Direction.NET,
+                direction=direction,  # 使用正确的方向
                 volume=pos,
                 price=price,
                 pnl=pnl,
@@ -933,10 +1181,18 @@ class OkxWebsocketPrivateApi(WebsocketClient):
             "sz": str(req.volume)
         }
 
+        # 添加posSide参数支持双向持仓
+        if self.position_mode == "long_short_mode":
+            if req.direction == Direction.LONG:
+                args["posSide"] = "long"
+            elif req.direction == Direction.SHORT:
+                args["posSide"] = "short"
+
+        # 设置保证金模式
         if contract.product == Product.SPOT:
             args["tdMode"] = "cash"
         else:
-            args["tdMode"] = "cross"
+            args["tdMode"] = self.margin_mode  # cross 或 isolated
 
         self.reqid += 1
         okx_req: dict = {
